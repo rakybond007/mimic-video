@@ -1,0 +1,9 @@
+# mimic-video dependencies (pyproject.toml 기준)
+einx>=0.3.0
+einops>=0.8.1
+hyper-connections>=0.4.3
+peft
+torch>=2.5
+torch-einops-utils>=0.0.17
+tqdm
+x-mlps-pytorch

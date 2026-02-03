@@ -1,0 +1,10 @@
+# mimic-video conda 환경 (pyproject.toml requires-python >= 3.10)
+name: mimic_video
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip

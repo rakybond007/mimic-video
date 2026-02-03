@@ -1,0 +1,6 @@
+# mimic-video test dependencies (pyproject.toml [test] 기준)
+-r requirements.txt
+pytest
+diffusers>=0.32.0
+transformers
+accelerate
