@@ -116,7 +116,7 @@ class Normalizer(Module):
 # lets stick with 0 noise to 1 data instead of the reverse
 
 def default_sample_time_fn(time, s = 0.999):
-    return torch.sqrt(s - time)
+    return torch.sqrt((s - time).clamp_min(0))
 
 class RandomFourierEmbed(Module):
     def __init__(self, dim):
@@ -354,7 +354,7 @@ class MimicVideo(Module):
         self.joint_normalizer = None
 
         if exists(joint_mean_std):
-            assert joint_mean_std == (2, dim_joint_state)
+            assert joint_mean_std.shape == (2, dim_joint_state), f'must be in shape of (2 dim_joint_state)'
             self.joint_normalizer = Normalizer(*joint_mean_std)
 
         # flow related
@@ -555,6 +555,7 @@ class MimicVideo(Module):
         *,
         actions,                        # (b na d)
         joint_state,                    # (b)
+        action_mask = None,             # (b d) bool - when provided, loss computed only on True dims
         task_ids = None,                # (b)
         advantage_ids = None,           # (b)
         dropout_advantage_ids = False,
@@ -876,7 +877,16 @@ class MimicVideo(Module):
 
             flow_loss = F.mse_loss(pred_flow, flow, reduction = 'none')
 
-            out = masked_mean(flow_loss, action_loss_mask)
+            # apply action_mask to compute loss only on valid dimensions (e.g. 7 out of 32)
+            if exists(action_mask):
+                dim_mask = action_mask.unsqueeze(1).expand_as(flow_loss)  # (b, na, d)
+                if exists(action_loss_mask):
+                    combined_mask = action_loss_mask & dim_mask
+                else:
+                    combined_mask = dim_mask
+                out = masked_mean(flow_loss, combined_mask)
+            else:
+                out = masked_mean(flow_loss, action_loss_mask)
 
         if not return_cache:
             return out

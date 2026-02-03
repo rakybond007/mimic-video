@@ -15,6 +15,7 @@ import einx
 
 from diffusers.models.transformers.transformer_cosmos import CosmosTransformer3DModel
 from diffusers.models.autoencoders.autoencoder_kl_cosmos import AutoencoderKLCosmos
+from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from transformers import T5EncoderModel, T5TokenizerFast, T5Config
 
 from torch_einops_utils import shape_with_replace, lens_to_mask, masked_mean
@@ -102,6 +103,45 @@ REAL_T5_CONFIG = dict(
     d_ff = 2048,
     num_layers = 12,
     num_heads = 16,
+)
+
+# Cosmos 2.0 configs (uses AutoencoderKLWan VAE, concat_padding_mask=True)
+
+TINY_TRANSFORMER_COSMOS2_CONFIG = dict(
+    in_channels = 17,    # 16 latent + 1 condition_mask channel
+    out_channels = 16,
+    num_attention_heads = 1,
+    attention_head_dim = 16,
+    mlp_ratio = 1.0,
+    text_embed_dim = 32,
+    adaln_lora_dim = 32,
+    patch_size = (1, 2, 2),
+    max_size = (4, 32, 32),   # must accommodate tiny VAE output (2x spatial compression)
+    extra_pos_embed_type = None,
+    concat_padding_mask = True,
+)
+
+TINY_VAE_COSMOS2_CONFIG = dict(
+    base_dim = 8,
+    z_dim = 16,
+    dim_mult = [1, 2],
+    temperal_downsample = [False, True],
+    num_res_blocks = 1,
+    attn_scales = [],
+    dropout = 0.0,
+    # actual compression: 2x spatial, 1x temporal (for tiny)
+    scale_factor_temporal = 1,
+    scale_factor_spatial = 2,
+)
+
+REAL_VAE_COSMOS2_CONFIG = dict(
+    base_dim = 96,
+    z_dim = 16,
+    dim_mult = [1, 2, 4, 4],
+    temperal_downsample = [False, True, True],
+    num_res_blocks = 2,
+    attn_scales = [],
+    dropout = 0.0,
 )
 
 DEFAULT_LORA_CONFIG = dict(
@@ -193,6 +233,18 @@ class CosmosPredictWrapper(Module):
             target = self.transformer.transformer_blocks[layer_index]
             self.hook_handles.append(target.register_forward_hook(lambda m, i, o: self.cached_hidden_states.append(o.detach().cpu())))
 
+    def _make_extra_transformer_kwargs(self, hidden_states: Tensor) -> dict:
+        """Create extra kwargs for transformer forward (Cosmos 2.0: condition_mask + padding_mask)."""
+        kwargs = {}
+        # Cosmos 2.0: in_channels=17 (16 latent + 1 condition_mask), concat_padding_mask adds +1 more
+        if self.transformer.config.in_channels > self.vae_latent_channels:
+            b, c, t, h, w = hidden_states.shape
+            kwargs['condition_mask'] = hidden_states.new_zeros(b, 1, t, h, w)
+        if getattr(self.transformer.config, 'concat_padding_mask', False):
+            h, w = hidden_states.shape[-2:]
+            kwargs['padding_mask'] = hidden_states.new_zeros(1, 1, h, w)
+        return kwargs
+
     def load_lora(self, lora_path: str):
         from peft import PeftModel
         if isinstance(self.transformer, PeftModel):
@@ -268,18 +320,22 @@ class CosmosPredictWrapper(Module):
                 fixed_prefix_mask = rearrange(fixed_prefix_mask, 'b f -> b 1 f 1 1')
                 padded_timestep = einx.where('b 1 f 1 1, , b 1 f 1 1', fixed_prefix_mask, 0., padded_timestep)
 
-            noisy_latents = torch.lerp(latents, noise, padded_timestep)
+            noisy_latents = torch.lerp(latents, noise, padded_timestep.to(latents.dtype))
+
+            # padding_mask required for Cosmos 2.0 (concat_padding_mask=True)
+            extra_kwargs = self._make_extra_transformer_kwargs(noisy_latents)
 
             self.transformer(
                 hidden_states = noisy_latents,
                 encoder_hidden_states = encoder_states,
                 timestep = padded_timestep * 1000,
-                return_dict = False
+                return_dict = False,
+                **extra_kwargs
             )
 
         else:
             # conditioning on time=0 for prefix (clean), and time=999 for future (noise)
-            
+
             num_prefix_frames = latents.shape[2]
 
             # timesteps
@@ -299,11 +355,14 @@ class CosmosPredictWrapper(Module):
 
             model_input = cat((latents, future_latents), dim = 2)
 
+            extra_kwargs = self._make_extra_transformer_kwargs(model_input)
+
             self.transformer(
                 hidden_states = model_input,
                 encoder_hidden_states = encoder_states,
                 timestep = timestep,
-                return_dict = False
+                return_dict = False,
+                **extra_kwargs
             )
 
         hiddens = self.cached_hidden_states[:len(self.extract_layers)]
@@ -410,15 +469,54 @@ class CosmosPredictWrapper(Module):
         if accelerator.is_main_process:
             accelerator.unwrap_model(self.transformer).save_pretrained(save_path)
 
-# cosmos 2.5 wrapper
+# cosmos 2.0 wrapper (uses AutoencoderKLWan VAE, concat_padding_mask=True)
 
-class Cosmos2_5PredictWrapper(CosmosPredictWrapper):
+class Cosmos2PredictWrapper(CosmosPredictWrapper):
+    """Cosmos 2.0 wrapper that loads components individually to avoid safety_checker dependency."""
+
     def __init__(
         self,
-        model_name: str = 'nvidia/Cosmos-Predict2.5-2B',
+        model_name: str = 'nvidia/Cosmos-Predict2-2B-Video2World',
         **kwargs
     ):
         super().__init__(
             model_name = model_name,
             **kwargs
         )
+
+    def _init_pretrained(self, model_name: str):
+        """Load Cosmos 2.0 components individually (bypasses pipeline safety_checker)."""
+        self.transformer = CosmosTransformer3DModel.from_pretrained(model_name, subfolder="transformer")
+        self.vae = AutoencoderKLWan.from_pretrained(model_name, subfolder="vae")
+        self.text_encoder = T5EncoderModel.from_pretrained(model_name, subfolder="text_encoder")
+        self.tokenizer = T5TokenizerFast.from_pretrained(model_name, subfolder="tokenizer")
+
+        # AutoencoderKLWan uses different config attr names than AutoencoderKLCosmos
+        self.vae_temporal_compression_ratio = self.vae.config.scale_factor_temporal
+        self.vae_spatial_compression_ratio = self.vae.config.scale_factor_spatial
+        self.vae_latent_channels = self.vae.config.z_dim
+
+    def _init_random_weights(self, tiny: bool = False):
+        config_t = TINY_TRANSFORMER_COSMOS2_CONFIG if tiny else dict(
+            in_channels = 17, out_channels = 16, num_attention_heads = 16,
+            attention_head_dim = 128, mlp_ratio = 4.0, text_embed_dim = 1024,
+            adaln_lora_dim = 256, patch_size = (1, 2, 2), max_size = (128, 240, 240),
+            extra_pos_embed_type = None, concat_padding_mask = True, rope_scale = (1.0, 3.0, 3.0),
+        )
+        config_v = TINY_VAE_COSMOS2_CONFIG if tiny else REAL_VAE_COSMOS2_CONFIG
+        config_5 = TINY_T5_CONFIG if tiny else REAL_T5_CONFIG
+
+        num_layers = max(28 if not tiny else 2, *[layer + 1 for layer in self.extract_layers])
+
+        self.transformer = CosmosTransformer3DModel(num_layers = num_layers, **config_t)
+        self.vae = AutoencoderKLWan(**config_v)
+        self.text_encoder = T5EncoderModel(T5Config(**config_5))
+        self.tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+
+        self.vae_temporal_compression_ratio = self.vae.config.scale_factor_temporal
+        self.vae_spatial_compression_ratio = self.vae.config.scale_factor_spatial
+        self.vae_latent_channels = self.vae.config.z_dim
+
+
+# backward compat alias
+Cosmos2_5PredictWrapper = Cosmos2PredictWrapper
