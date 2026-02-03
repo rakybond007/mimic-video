@@ -1,0 +1,56 @@
+# LIBERO training configuration for MimicVideo
+# Usage: python scripts/train.py --config configs/libero.yaml --dataset_path /path/to/data
+
+# ---- Model ----
+dim: 512
+depth: 8
+heads: 8
+dim_head: 64
+action_chunk_len: 16
+dim_action: 32                     # max_action_dim (LIBERO uses 7 real dims)
+dim_joint_state: 64                # max_state_dim (LIBERO uses 7 real dims)
+num_video_viewpoints: 2            # front + wrist
+proprio_mask_prob: 0.1
+model_output_clean: false          # false = direct velocity prediction (like GR00T)
+                                   # true  = x0 prediction with 1/(1-t) scaling (Kaiming He)
+
+# ---- Video Encoder ----
+video_model: "nvidia/Cosmos-Predict2-2B-Video2World"
+extract_layer: 19
+
+# ---- Data ----
+dataset_path: ""                   # REQUIRED: path to LeRobot-format LIBERO dataset
+data_config: "libero"
+video_resolution: 224
+action_horizon: 16
+num_frames: 1                      # number of video frames (observation_indices length)
+
+# ---- Training (HuggingFace TrainingArguments) ----
+output_dir: "./checkpoints/libero"
+learning_rate: 1.0e-4
+adam_beta1: 0.95
+adam_beta2: 0.999
+weight_decay: 1.0e-5
+warmup_ratio: 0.05
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+max_steps: 50000
+save_steps: 5000
+save_total_limit: 5
+logging_steps: 10
+bf16: true
+tf32: true
+lr_scheduler_type: "cosine"
+report_to: "wandb"
+seed: 42
+
+# ---- Backbone ----
+freeze_video_backbone: true           # freeze Cosmos backbone, train only MimicVideo head (73M params)
+
+# ---- LoRA (0 = disabled) ----
+lora_rank: 0
+lora_alpha: 16
+lora_dropout: 0.1
+
+# ---- Resume ----
+resume_from_checkpoint: false
