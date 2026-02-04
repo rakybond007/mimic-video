@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name="MimicVideo-Eval-LIBERO"
+#SBATCH --job-name="MimicVideo-Eval-8f"
 #SBATCH --nodes=1
 #SBATCH --gpus=1
 #SBATCH --partition=background
 #SBATCH --array=0-9
-#SBATCH --output=out/%A_%a-mimic_eval.out
-#SBATCH --error=out/%A_%a-mimic_eval.err
+#SBATCH --output=out/%A_%a-mimic_eval_8f.out
+#SBATCH --error=out/%A_%a-mimic_eval_8f.err
 
 # ---- Paths ----
 WORK_DIR=/rlwrld3/home/hojin/vam_workspace/mimic-video
@@ -13,10 +13,11 @@ BASE_DIR=/rlwrld3/home/hojin/multigpu_workspace
 CONDA_PATH=/rlwrld3/home/hojin/miniconda3
 
 # ---- Checkpoint ----
-CKPT_NAME="libero_cosmos2_frozen"
-CKPT_STEP=60000
+CKPT_NAME="libero_cosmos2_frozen_8frame_60k"
+CKPT_STEP=30000
 CKPT_DIR=$WORK_DIR/checkpoints/$CKPT_NAME/checkpoint-$CKPT_STEP
-NUM_FRAMES=1
+NUM_FRAMES=8
+NUM_TRIALS=3
 OUTPUT_BASE=$WORK_DIR/eval_output/${CKPT_NAME}_${CKPT_STEP}
 
 # ---- Setup LIBERO config to avoid interactive input prompt ----
@@ -37,7 +38,7 @@ EOF
 PORT=$((5555 + ${SLURM_ARRAY_TASK_ID:-0}))
 TASK_IDX=${SLURM_ARRAY_TASK_ID:-0}
 
-echo "[i] Evaluating: CKPT=$CKPT_DIR, NUM_FRAMES=$NUM_FRAMES, TASK_IDX=$TASK_IDX, PORT=$PORT"
+echo "[i] Evaluating: CKPT=$CKPT_DIR, NUM_FRAMES=$NUM_FRAMES, NUM_TRIALS=$NUM_TRIALS, TASK_IDX=$TASK_IDX, PORT=$PORT"
 
 # ---- Start policy server (mimic_video env) ----
 "$CONDA_PATH"/envs/mimic_video/bin/python "$WORK_DIR/scripts/serve_policy.py" \
@@ -62,6 +63,7 @@ for TASK_NAME in "${TASK_NAMES[@]}"; do
         --port $PORT \
         --replan_steps 5 \
         --num_frames $NUM_FRAMES \
+        --num_trials_per_task $NUM_TRIALS \
         >& "$OUTPUT_DIR/eval-$TASK_IDX.log" &
     EVAL_PIDS+=($!)
 done

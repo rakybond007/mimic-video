@@ -249,6 +249,26 @@ class MimicVideoPolicy:
             "video_resolution": 224,
         }
 
+        # Load weights from sharded safetensors
+        state_dict = _load_safetensors_checkpoint(ckpt_path)
+
+        # Extract normalizer stats from checkpoint so the model creates
+        # proper Normalizer objects (register_buffer) before load_state_dict.
+        # Without this, strict=False silently drops the 4 normalizer buffer
+        # keys and all normalize/inverse_normalize calls become no-ops.
+        action_mean_std = None
+        joint_mean_std = None
+        if "action_normalizer.mean" in state_dict and "action_normalizer.std" in state_dict:
+            action_mean_std = torch.stack([
+                state_dict["action_normalizer.mean"],
+                state_dict["action_normalizer.std"],
+            ])
+        if "joint_normalizer.mean" in state_dict and "joint_normalizer.std" in state_dict:
+            joint_mean_std = torch.stack([
+                state_dict["joint_normalizer.mean"],
+                state_dict["joint_normalizer.std"],
+            ])
+
         # Build model (architecture must match training)
         video_wrapper = _build_video_wrapper(ckpt_path)
         model = MimicVideo(
@@ -259,10 +279,10 @@ class MimicVideoPolicy:
             dim_joint_state=config["dim_joint_state"],
             num_video_viewpoints=2,
             model_output_clean=False,
+            action_mean_std=action_mean_std,
+            joint_mean_std=joint_mean_std,
         )
 
-        # Load weights from sharded safetensors
-        state_dict = _load_safetensors_checkpoint(ckpt_path)
         model.load_state_dict(state_dict, strict=False)
 
         return cls(model=model, config=config, device=device)

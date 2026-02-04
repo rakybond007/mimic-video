@@ -36,6 +36,42 @@ import numpy as np
 import tqdm
 
 
+# ---- Frame buffer for multi-frame eval ----
+
+class FrameBuffer:
+    """
+    Rolling buffer that accumulates frames up to `maxlen`.
+
+    When fewer than `maxlen` frames have been collected, the last frame is
+    duplicated to pad up to `maxlen`.  After that, only the most recent
+    `maxlen` frames are kept.
+
+    Usage:
+        buf = FrameBuffer(maxlen=8)
+        buf.append(frame)          # frame: (H, W, C) uint8
+        stacked = buf.get()        # -> (maxlen, H, W, C) uint8
+    """
+
+    def __init__(self, maxlen: int = 1):
+        self.maxlen = maxlen
+        self._buf: collections.deque = collections.deque(maxlen=maxlen)
+
+    def reset(self):
+        self._buf.clear()
+
+    def append(self, frame: np.ndarray):
+        self._buf.append(frame)
+
+    def get(self) -> np.ndarray:
+        """Return (maxlen, H, W, C) array, padding with the last frame if needed."""
+        assert len(self._buf) > 0, "FrameBuffer is empty; call append() first"
+        frames = list(self._buf)
+        # Pad by repeating the last frame
+        while len(frames) < self.maxlen:
+            frames.insert(0, frames[0])
+        return np.stack(frames, axis=0)
+
+
 # ---- HTTP client (stdlib only, no extra packages) ----
 
 def _encode_value(obj):
@@ -163,6 +199,13 @@ def eval_libero(args):
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
+    num_frames = getattr(args, "num_frames", 1)
+    logging.info(f"Using {num_frames} frame(s) per inference step")
+
+    # Frame buffers for each camera view
+    front_buf = FrameBuffer(maxlen=num_frames)
+    wrist_buf = FrameBuffer(maxlen=num_frames)
+
     client = None
     total_episodes, total_successes = 0, 0
 
@@ -197,19 +240,31 @@ def eval_libero(args):
                 task_successes += 1
                 continue
 
-            # Connect to server lazily
+            # Connect to server lazily (retry up to 300s for model loading)
             if client is None:
+                import time as _time
                 client = PolicyClient(host=args.host, port=args.port)
-                logging.info(f"Connecting to server at {args.host}:{args.port}...")
-                if not client.ping():
-                    raise ConnectionError(f"Cannot ping server at {args.host}:{args.port}")
+                logging.info(f"Waiting for server at {args.host}:{args.port}...")
+                max_retries, retry_interval = 60, 5  # 60 * 5s = 300s max
+                for _retry in range(max_retries):
+                    if client.ping():
+                        break
+                    logging.info(f"  Server not ready, retrying in {retry_interval}s... ({_retry+1}/{max_retries})")
+                    _time.sleep(retry_interval)
+                else:
+                    raise ConnectionError(
+                        f"Cannot ping server at {args.host}:{args.port} "
+                        f"after {max_retries * retry_interval}s"
+                    )
                 logging.info("Connected.")
 
             action_plan = collections.deque()
 
-            # Reset environment
+            # Reset environment and frame buffers
             env.reset()
             obs = env.set_init_state(initial_states[episode_idx])
+            front_buf.reset()
+            wrist_buf.reset()
 
             t = 0
             replay_images = []
@@ -237,14 +292,19 @@ def eval_libero(args):
                         imageio.imwrite(f"{img_prefix}_img.png", img)
                         imageio.imwrite(f"{img_prefix}_wrist.png", wrist_img)
 
+                    # Accumulate frames in buffers
+                    front_buf.append(img)
+                    wrist_buf.append(wrist_img)
+
                     # Save for replay video
                     replay_images.append(img)
 
                     if not action_plan:
                         # Build observation dict for server
+                        # front_buf.get() -> (num_frames, H, W, C)
                         element = {
-                            "video.front_view": np.array([img]),
-                            "video.left_wrist_view": np.array([wrist_img]),
+                            "video.front_view": front_buf.get(),
+                            "video.left_wrist_view": wrist_buf.get(),
                             "state.eef_pos_absolute": obs["robot0_eef_pos"],
                             "state.eef_rot_absolute": _quat2axisangle(obs["robot0_eef_quat"]),
                             "state.gripper_close": obs["robot0_gripper_qpos"],
@@ -347,6 +407,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_trials_per_task", type=int, default=50)
     parser.add_argument("--num_steps_wait", type=int, default=10)
     parser.add_argument("--replan_steps", type=int, default=5, help="Steps before replanning")
+    parser.add_argument(
+        "--num_frames", type=int, default=1,
+        help="Number of video frames per inference step. "
+             "When < num_frames frames collected, pad by repeating last frame.",
+    )
 
     # Output
     parser.add_argument("--video_out_path", type=str, default="./eval_output")
