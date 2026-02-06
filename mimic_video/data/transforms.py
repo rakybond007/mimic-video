@@ -214,8 +214,11 @@ class VideoColorJitter:
 class StateActionNormalize:
     """
     Normalize state/action values using dataset statistics.
-    Supports min_max and mean_std normalization modes.
-    Stats must be passed at call time or set via set_stats().
+
+    Following AlinVLA/GR00T pattern:
+    - min_max: maps to [-1, 1] range (not [0, 1])
+    - Provides unapply() for inverse transform at inference
+    - Stats are stored and reused for both apply and unapply
     """
 
     def __init__(
@@ -226,36 +229,90 @@ class StateActionNormalize:
         self.apply_to = apply_to
         self.normalization_modes = normalization_modes or {}
         self._stats = None
+        self._tensors = {}  # Cached tensor stats for efficiency
 
     def set_stats(self, stats: dict):
+        """Set statistics and cache as tensors."""
         self._stats = stats
+        self._tensors = {}
+
+        for key in self.apply_to:
+            key_stats = stats.get(key)
+            if key_stats is None:
+                continue
+            self._tensors[key] = {
+                k: torch.tensor(v, dtype=torch.float32)
+                for k, v in key_stats.items()
+            }
 
     def __call__(self, sample: dict, stats: Optional[dict] = None) -> dict:
-        stats = stats or self._stats
-        if stats is None:
+        """Apply normalization (forward transform)."""
+        if stats is not None and stats != self._stats:
+            self.set_stats(stats)
+
+        if self._stats is None:
             return sample
 
         for key in self.apply_to:
             if key not in sample:
                 continue
-            mode = self.normalization_modes.get(key, "min_max")
-            key_stats = stats.get(key)
-            if key_stats is None:
+            if key not in self._tensors:
                 continue
+
+            mode = self.normalization_modes.get(key, "min_max")
+            key_tensors = self._tensors[key]
 
             value = sample[key]
             if isinstance(value, np.ndarray):
                 value = torch.from_numpy(value).float()
 
             if mode == "min_max":
-                vmin = torch.tensor(key_stats["min"], dtype=torch.float32)
-                vmax = torch.tensor(key_stats["max"], dtype=torch.float32)
+                # AlinVLA style: map to [-1, 1]
+                # Formula: 2 * (x - min) / (max - min) - 1
+                vmin = key_tensors["min"]
+                vmax = key_tensors["max"]
                 denom = (vmax - vmin).clamp_min(1e-8)
-                value = (value - vmin) / denom
+                value = 2.0 * (value - vmin) / denom - 1.0
+                # Clip to [-1, 1] for safety
+                value = value.clamp(-1.0, 1.0)
             elif mode == "mean_std":
-                mean = torch.tensor(key_stats["mean"], dtype=torch.float32)
-                std = torch.tensor(key_stats["std"], dtype=torch.float32).clamp_min(1e-8)
+                mean = key_tensors["mean"]
+                std = key_tensors["std"].clamp_min(1e-8)
                 value = (value - mean) / std
+
+            sample[key] = value
+        return sample
+
+    def unapply(self, sample: dict) -> dict:
+        """Apply inverse normalization (for action output at inference)."""
+        if self._stats is None:
+            return sample
+
+        for key in self.apply_to:
+            if key not in sample:
+                continue
+            if key not in self._tensors:
+                continue
+
+            mode = self.normalization_modes.get(key, "min_max")
+            key_tensors = self._tensors[key]
+
+            value = sample[key]
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(value).float()
+
+            # Move stats to same device as value
+            device = value.device if isinstance(value, torch.Tensor) else 'cpu'
+
+            if mode == "min_max":
+                # Inverse: (x + 1) / 2 * (max - min) + min
+                vmin = key_tensors["min"].to(device)
+                vmax = key_tensors["max"].to(device)
+                value = (value + 1.0) / 2.0 * (vmax - vmin) + vmin
+            elif mode == "mean_std":
+                mean = key_tensors["mean"].to(device)
+                std = key_tensors["std"].to(device)
+                value = value * std + mean
 
             sample[key] = value
         return sample

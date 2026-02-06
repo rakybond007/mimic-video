@@ -70,73 +70,25 @@ def build_video_wrapper(config: dict):
 
 
 def build_model(config: dict, dataset=None, video_wrapper=None) -> torch.nn.Module:
-    """Build MimicVideo model with CosmosPredictWrapper."""
+    """Build MimicVideo model with CosmosPredictWrapper.
+
+    Note: We use AlinVLA-style transform-based normalization (min_max to [-1,1])
+    instead of model-internal Normalizer. The StateActionNormalize transform handles
+    normalization during training, and policy.unapply() handles denormalization at inference.
+    Therefore, we do NOT pass action_mean_std or joint_mean_std to the model.
+    """
     from mimic_video.mimic_video import MimicVideo
 
     if video_wrapper is None:
         video_wrapper = build_video_wrapper(config)
 
-    # Get action/joint normalization stats from dataset's stats.json if available
-    # Falls back to computing from samples if stats.json not found
-    action_mean_std = None
-    joint_mean_std = None
-    if dataset is not None:
-        stats = getattr(dataset, '_stats', None) or getattr(dataset, 'stats', {})
-        use_precomputed = False
-        dim_action = config.get("dim_action", 32)
-        dim_state = config.get("dim_joint_state", 64)
+    if _is_main_process():
+        print("Using AlinVLA-style transform normalization (min_max to [-1,1])")
+        print("  Model internal Normalizer is disabled")
+        print("  StateActionNormalize transform handles normalization")
 
-        if stats:
-            # Try to build normalizer stats from dataset's stats.json
-            # LeRobot stats format: {"action": {"mean": [...], "std": [...]}, "observation.state": {...}}
-            try:
-                action_stats = stats.get("action", {})
-                state_stats = stats.get("observation.state", {})
-
-                if action_stats and state_stats:
-                    action_means = action_stats.get("mean", [])
-                    action_stds = action_stats.get("std", [])
-                    state_means = state_stats.get("mean", [])
-                    state_stds = state_stats.get("std", [])
-
-                    if action_means and state_means:
-                        # Pad to max dims
-                        action_mean = torch.zeros(dim_action)
-                        action_std = torch.ones(dim_action)
-                        action_mean[:len(action_means)] = torch.tensor(action_means, dtype=torch.float32)
-                        action_std[:len(action_stds)] = torch.tensor(action_stds, dtype=torch.float32).clamp(min=1e-6)
-
-                        state_mean = torch.zeros(dim_state)
-                        state_std = torch.ones(dim_state)
-                        state_mean[:len(state_means)] = torch.tensor(state_means, dtype=torch.float32)
-                        state_std[:len(state_stds)] = torch.tensor(state_stds, dtype=torch.float32).clamp(min=1e-6)
-
-                        action_mean_std = torch.stack([action_mean, action_std])
-                        joint_mean_std = torch.stack([state_mean, state_std])
-                        use_precomputed = True
-
-                        if _is_main_process():
-                            real_a = len(action_means)
-                            real_s = len(state_means)
-                            print(f"Using precomputed stats from dataset's stats.json")
-                            print(f"  action: {real_a} dims, state: {real_s} dims")
-                            print(f"  action_mean_std: mean=[{action_mean_std[0,:real_a].min():.4f}, {action_mean_std[0,:real_a].max():.4f}], "
-                                  f"std=[{action_mean_std[1,:real_a].min():.4f}, {action_mean_std[1,:real_a].max():.4f}]")
-            except (KeyError, TypeError) as e:
-                if _is_main_process():
-                    print(f"Could not use precomputed stats: {e}")
-
-        if not use_precomputed:
-            if _is_main_process():
-                print("Computing action/joint normalization stats from dataset samples...")
-            action_mean_std, joint_mean_std = compute_normalizer_stats(dataset, num_samples=5000)
-            if _is_main_process():
-                real_a = action_mean_std[0][action_mean_std[1] < 0.999].numel()
-                print(f"  action_mean_std: shape={action_mean_std.shape}, "
-                      f"real dims mean range=[{action_mean_std[0,:real_a].min():.4f}, {action_mean_std[0,:real_a].max():.4f}], "
-                      f"std range=[{action_mean_std[1,:real_a].min():.4f}, {action_mean_std[1,:real_a].max():.4f}]")
-
-    # Build MimicVideo model
+    # Build MimicVideo model WITHOUT internal normalizer
+    # Normalization is handled by StateActionNormalize transform (AlinVLA style)
     model = MimicVideo(
         dim=config.get("dim", 512),
         video_predict_wrapper=video_wrapper,
@@ -150,8 +102,7 @@ def build_model(config: dict, dataset=None, video_wrapper=None) -> torch.nn.Modu
         num_video_viewpoints=config.get("num_video_viewpoints", 2),
         model_output_clean=config.get("model_output_clean", False),
         inject_language_tokens=config.get("inject_language_tokens", False),
-        action_mean_std=action_mean_std,
-        joint_mean_std=joint_mean_std,
+        # No action_mean_std or joint_mean_std - using transform-based normalization
     )
 
     return model

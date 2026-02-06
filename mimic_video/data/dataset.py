@@ -171,11 +171,54 @@ class BaseLeRobotDataset(Dataset):
             return {}
 
     def _set_transform_stats(self):
-        """Pass stats to the normalization transform."""
-        if self._stats and self.transforms:
-            for t in self.transforms.transforms:
-                if hasattr(t, "set_stats"):
-                    t.set_stats(self._stats)
+        """Pass stats to the normalization transform.
+
+        The stats.json has concatenated stats (observation.state, action),
+        but transforms expect per-key stats (state.eef_pos_absolute, etc.).
+        This method slices the concatenated stats using modality.json indices.
+        """
+        if not self._stats or not self.transforms:
+            return
+
+        # Build per-key stats from concatenated stats using modality.json indices
+        per_key_stats = self._build_per_key_stats()
+
+        for t in self.transforms.transforms:
+            if hasattr(t, "set_stats"):
+                t.set_stats(per_key_stats)
+
+    def _build_per_key_stats(self) -> dict:
+        """Build per-key stats by slicing concatenated stats using modality.json."""
+        per_key_stats = {}
+
+        # Map from our modality type to stats.json key
+        stats_key_map = {
+            "state": "observation.state",
+            "action": "action",
+        }
+
+        for modality_type, stats_key in stats_key_map.items():
+            if stats_key not in self._stats:
+                continue
+
+            concat_stats = self._stats[stats_key]
+            meta_section = self._modality_meta.get(modality_type, {})
+
+            for subkey, meta in meta_section.items():
+                start = meta.get("start")
+                end = meta.get("end")
+                if start is None or end is None:
+                    continue
+
+                full_key = f"{modality_type}.{subkey}"
+                per_key_stats[full_key] = {}
+
+                for stat_name in ["min", "max", "mean", "std", "q01", "q99"]:
+                    if stat_name in concat_stats:
+                        values = concat_stats[stat_name]
+                        per_key_stats[full_key][stat_name] = values[start:end]
+
+        return per_key_stats
 
     @property
     def stats(self) -> dict:

@@ -146,12 +146,27 @@ class LiberoDataConfig(BaseDataConfig):
                     hue=0.08,
                 )
             )
-        # Note: State/action normalization is handled by MimicVideo's internal
-        # Normalizer (mean/std from stats.json). Do NOT apply StateActionNormalize
-        # here, as it would create a mismatch between training and inference:
-        # - Training: StateActionNormalize + Model.Normalizer (double normalization)
-        # - Inference: Model.Normalizer only (policy provides raw values)
+        # State/action normalization using min_max to [-1, 1] (AlinVLA style)
+        # The StateActionNormalize transform stores stats and provides unapply()
+        # for inverse transform at inference time.
+        transforms.append(
+            StateActionNormalize(
+                apply_to=self.state_keys + self.action_keys,
+                normalization_modes={key: "min_max" for key in self.state_keys + self.action_keys},
+            )
+        )
         return Compose(transforms)
+
+    def state_action_normalize(self) -> StateActionNormalize:
+        """
+        Get a StateActionNormalize transform instance for inference.
+        This is used by the policy to apply the same normalization at inference
+        and unapply (inverse) on the action output.
+        """
+        return StateActionNormalize(
+            apply_to=self.state_keys + self.action_keys,
+            normalization_modes={key: "min_max" for key in self.state_keys + self.action_keys},
+        )
 
 
 # Registry of built-in data configs
