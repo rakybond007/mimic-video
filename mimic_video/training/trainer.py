@@ -110,6 +110,7 @@ class MimicVideoTrainer(transformers.Trainer):
         action_mask = inputs["action_mask"]  # (B, max_action_dim)
         joint_state = inputs["joint_state"]  # (B, T, max_state_dim)
         prompts = inputs.get("prompts")  # list[str] or None
+        future_video = inputs.get("future_video")  # (B, V, T_future, C, H, W) or None
 
         # MimicVideo.forward() expects joint_state as (B, D) - take the last timestep
         if joint_state.ndim == 3:
@@ -122,6 +123,7 @@ class MimicVideoTrainer(transformers.Trainer):
             joint_state=joint_state_input,
             action_mask=action_mask,
             video=video,
+            future_video=future_video,
             prompts=prompts,
             no_grad_video_model_forward=self.freeze_video_backbone,
         )

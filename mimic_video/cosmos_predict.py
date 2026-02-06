@@ -483,6 +483,148 @@ class Cosmos2PredictWrapper(CosmosPredictWrapper):
             model_name = model_name,
             **kwargs
         )
+        # Cache for T5 encoder hidden states (for language token injection)
+        self._cached_text_states = None
+
+    @property
+    def text_dim(self):
+        """Return T5 encoder hidden dimension for language projection."""
+        return self.text_encoder.config.d_model  # 1024
+
+    def forward(
+        self,
+        videos: Tensor,
+        prompts: str | list[str] | None = None,
+        prompt_token_ids: Tensor | None = None,
+        timestep: float | Tensor | None = None,
+        predict_num_future_latents = 0,
+        future_videos: Tensor | None = None,  # (B, T_future, C, H, W) future frames for Algorithm 2
+    ) -> Tensor | list[Tensor]:
+        """
+        Algorithm 2 from Mimic-Video paper:
+        - past_latents (from `videos`): clean (τ=0)
+        - future_latents (from `future_videos`): noised with τv (timestep)
+
+        If future_videos is provided, we use Algorithm 2 training mode.
+        Otherwise falls back to parent behavior.
+        """
+        batch = videos.shape[0]
+        videos = self.normalize(videos)
+
+        if isinstance(prompts, str): prompts = [prompts] * batch
+
+        self.cached_hidden_states.clear()
+
+        videos = rearrange(videos, 'b t c h w -> b c t h w').to(self.device)
+
+        if exists(prompt_token_ids):
+            text_inputs = dict(input_ids = prompt_token_ids.to(self.device))
+        else:
+            text_inputs = self.tokenizer(default(prompts, [""] * batch), return_tensors = "pt", padding = True, truncation = True, max_length = 512).to(self.device)
+
+        encoder_states = self.text_encoder(**text_inputs)
+        if hasattr(encoder_states, 'last_hidden_state'):
+            encoder_states = encoder_states.last_hidden_state
+
+        # Cache T5 states for language token injection
+        self._cached_text_states = encoder_states.detach()
+
+        past_latents = self.vae.encode(videos).latent_dist.sample()
+
+        # Algorithm 2: past clean (τ=0), future noised (τ=timestep)
+        if exists(future_videos):
+            future_videos = self.normalize(future_videos)
+            future_videos = rearrange(future_videos, 'b t c h w -> b c t h w').to(self.device)
+            future_latents = self.vae.encode(future_videos).latent_dist.sample()
+
+            # Handle timestep for future frames
+            if exists(timestep):
+                timestep = cast_tensor(timestep, device = self.device)
+                if timestep.ndim == 0:
+                    timestep = rearrange(timestep, '-> 1')
+                if timestep.shape[0] != batch:
+                    timestep = repeat(timestep, '1 -> b', b = batch)
+            else:
+                timestep = tensor(0., device = self.device)
+                timestep = repeat(timestep, '-> b', b = batch)
+
+            # Noise future latents
+            noise = torch.randn_like(future_latents)
+            future_frames = future_latents.shape[2]
+            padded_timestep_future = repeat(timestep, 'b -> b 1 f 1 1', f = future_frames)
+            noisy_future_latents = torch.lerp(future_latents, noise, padded_timestep_future.to(future_latents.dtype))
+
+            # Concat: [past_clean, future_noised]
+            model_input = cat((past_latents, noisy_future_latents), dim = 2)
+
+            # Build timestep tensor: 0 for past, timestep for future
+            past_frames = past_latents.shape[2]
+            total_frames = past_frames + future_frames
+            full_timestep = torch.zeros((batch, 1, total_frames, 1, 1), device = self.device)
+            full_timestep[:, :, past_frames:] = padded_timestep_future
+
+            extra_kwargs = self._make_extra_transformer_kwargs(model_input)
+
+            self.transformer(
+                hidden_states = model_input,
+                encoder_hidden_states = encoder_states,
+                timestep = full_timestep * 1000,
+                return_dict = False,
+                **extra_kwargs
+            )
+
+        elif predict_num_future_latents > 0:
+            # Inference mode: clean prefix + noise future (from parent)
+            num_prefix_frames = past_latents.shape[2]
+            total_frames = num_prefix_frames + predict_num_future_latents
+
+            timestep = torch.zeros((batch, 1, total_frames, 1, 1), device = self.device)
+            timestep[:, :, num_prefix_frames:] = 999.
+
+            pred_shape = (batch, past_latents.shape[1], predict_num_future_latents, past_latents.shape[3], past_latents.shape[4])
+            future_latents = torch.randn(pred_shape, device = past_latents.device)
+
+            model_input = cat((past_latents, future_latents), dim = 2)
+
+            extra_kwargs = self._make_extra_transformer_kwargs(model_input)
+
+            self.transformer(
+                hidden_states = model_input,
+                encoder_hidden_states = encoder_states,
+                timestep = timestep,
+                return_dict = False,
+                **extra_kwargs
+            )
+
+        else:
+            # Training without future_videos: noise all frames uniformly (original behavior)
+            if exists(timestep):
+                timestep = cast_tensor(timestep, device = self.device)
+                if timestep.ndim == 0:
+                    timestep = rearrange(timestep, '-> 1')
+                if timestep.shape[0] != batch:
+                    timestep = repeat(timestep, '1 -> b', b = batch)
+            else:
+                timestep = tensor(0., device = self.device)
+                timestep = repeat(timestep, '-> b', b = batch)
+
+            noise = torch.randn_like(past_latents)
+            frames = past_latents.shape[2]
+            padded_timestep = repeat(timestep, 'b -> b 1 f 1 1', f = frames)
+            noisy_latents = torch.lerp(past_latents, noise, padded_timestep.to(past_latents.dtype))
+
+            extra_kwargs = self._make_extra_transformer_kwargs(noisy_latents)
+
+            self.transformer(
+                hidden_states = noisy_latents,
+                encoder_hidden_states = encoder_states,
+                timestep = padded_timestep * 1000,
+                return_dict = False,
+                **extra_kwargs
+            )
+
+        hiddens = self.cached_hidden_states[:len(self.extract_layers)]
+        return hiddens if self.return_list else hiddens[0]
 
     def _init_pretrained(self, model_name: str):
         """Load Cosmos 2.0 components individually (bypasses pipeline safety_checker)."""

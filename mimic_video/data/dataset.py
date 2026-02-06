@@ -217,6 +217,9 @@ class BaseLeRobotDataset(Dataset):
 
                 if modality == "video":
                     data[key] = self._get_video(ep_id, key, step_indices, traj_len)
+                elif modality == "future_video":
+                    # Store future video with "future_" prefix
+                    data[f"future_{key}"] = self._get_video(ep_id, key, step_indices, traj_len)
                 elif modality == "language":
                     data[key] = self._get_language(traj_data, key, base_step)
                 else:
@@ -441,6 +444,7 @@ class BaseLeRobotDataset(Dataset):
 
         Returns dict with:
             video: (V, T, C, H, W) float32 tensor
+            future_video: (V, T_future, C, H, W) float32 tensor (if future_video_indices set)
             actions: (horizon, max_action_dim) float32 tensor
             action_mask: (max_action_dim,) bool tensor
             joint_state: (T, max_state_dim) float32 tensor
@@ -457,6 +461,37 @@ class BaseLeRobotDataset(Dataset):
                 v = v.unsqueeze(0)  # (C, H, W) → (1, C, H, W)
             video_tensors.append(v)
         video = torch.stack(video_tensors, dim=0)  # (V, T, C, H, W)
+
+        # Stack future video views if available (Algorithm 2)
+        # Note: future_video keys are not transformed, so we apply same processing as video
+        future_video = None
+        if self.data_config.future_video_indices:
+            future_video_tensors = []
+            for vk in self.data_config.video_keys:
+                fv_key = f"future_{vk}"
+                if fv_key in sample:
+                    fv = sample[fv_key]
+                    # fv shape: (T, H, W, C) raw from video loader
+                    if isinstance(fv, np.ndarray):
+                        # Apply same transforms as video: HWC -> CHW, normalize, resize
+                        fv = torch.from_numpy(fv).float()
+                        if fv.ndim == 3:
+                            fv = fv.unsqueeze(0)  # (H, W, C) → (1, H, W, C)
+                        # (T, H, W, C) -> (T, C, H, W)
+                        if fv.shape[-1] == 3:
+                            fv = fv.permute(0, 3, 1, 2)
+                        # Normalize to [0, 1]
+                        if fv.max() > 1.0:
+                            fv = fv / 255.0
+                        # Resize to video_resolution
+                        if hasattr(self.data_config, 'video_resolution'):
+                            res = self.data_config.video_resolution
+                            fv = torch.nn.functional.interpolate(
+                                fv, size=(res, res), mode='bilinear', align_corners=False
+                            )
+                    future_video_tensors.append(fv)
+            if future_video_tensors:
+                future_video = torch.stack(future_video_tensors, dim=0)  # (V, T_future, C, H, W)
 
         # Concatenate and pad state
         state_parts = []
@@ -503,7 +538,7 @@ class BaseLeRobotDataset(Dataset):
                 prompt = sample[lk]
                 break
 
-        return {
+        result = {
             "video": video,
             "actions": actions,
             "action_mask": action_mask,
@@ -511,6 +546,12 @@ class BaseLeRobotDataset(Dataset):
             "state_mask": state_mask,
             "prompt": prompt,
         }
+
+        # Add future_video if available (Algorithm 2)
+        if future_video is not None:
+            result["future_video"] = future_video
+
+        return result
 
 
 class LeRobotLiberoDataset(BaseLeRobotDataset):

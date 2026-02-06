@@ -45,10 +45,11 @@ class BaseDataConfig(ABC):
     language_keys: list[str] = field(default_factory=list)
     observation_indices: list[int] = field(default_factory=lambda: [0])
     action_indices: list[int] = field(default_factory=lambda: list(range(16)))
+    future_video_indices: list[int] = field(default_factory=list)  # e.g., [1] or [16] for Algorithm 2
 
     def modality_config(self) -> dict[str, ModalityConfig]:
         """Build ModalityConfig for each modality."""
-        return {
+        configs = {
             "video": ModalityConfig(
                 delta_indices=self.observation_indices,
                 modality_keys=self.video_keys,
@@ -66,6 +67,13 @@ class BaseDataConfig(ABC):
                 modality_keys=self.language_keys,
             ),
         }
+        # Add future_video modality if future_video_indices is set
+        if self.future_video_indices:
+            configs["future_video"] = ModalityConfig(
+                delta_indices=self.future_video_indices,
+                modality_keys=self.video_keys,  # Use same keys as video
+            )
+        return configs
 
     @abstractmethod
     def transform(self, training: bool = True) -> Compose:
@@ -76,9 +84,13 @@ class BaseDataConfig(ABC):
 class LiberoDataConfig(BaseDataConfig):
     """LIBERO dataset configuration."""
 
-    def __init__(self, num_frames: int = 1, video_resolution: int = 224):
-        # Set observation_indices based on num_frames
+    def __init__(self, num_frames: int = 1, video_resolution: int = 224, num_future_frames: int = 0):
+        # Set observation_indices based on num_frames (past frames)
         observation_indices = list(range(-num_frames + 1, 1))  # e.g. [0] for 1, [-1, 0] for 2
+
+        # Set future_video_indices if num_future_frames > 0
+        # Algorithm 2: future frames are at positive indices relative to current step
+        future_video_indices = list(range(1, num_future_frames + 1)) if num_future_frames > 0 else []
 
         super().__init__(
             video_keys=["video.front_view", "video.left_wrist_view"],
@@ -95,8 +107,10 @@ class LiberoDataConfig(BaseDataConfig):
             language_keys=["annotation.human.action.task_description"],
             observation_indices=observation_indices,
             action_indices=list(range(16)),
+            future_video_indices=future_video_indices,
         )
         self.video_resolution = video_resolution
+        self.num_future_frames = num_future_frames
 
     def transform(self, training: bool = True) -> Compose:
         transforms = [
