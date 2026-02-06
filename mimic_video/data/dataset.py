@@ -231,7 +231,9 @@ class BaseLeRobotDataset(Dataset):
         ep_id, base_step = self._all_steps[index]
         sample = self._get_step_data(ep_id, base_step)
         # Apply transforms (video crop/resize/jitter, state/action normalize)
-        sample = self.transforms(sample, stats=self._stats)
+        # Note: Don't pass stats here - StateActionNormalize already has per_key_stats
+        # set via _set_transform_stats(). Passing self._stats would overwrite with wrong format.
+        sample = self.transforms(sample)
         # Post-process: stack video views, pad state/action, create masks
         return self._postprocess(sample)
 
