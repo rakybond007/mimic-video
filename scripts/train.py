@@ -76,18 +76,65 @@ def build_model(config: dict, dataset=None, video_wrapper=None) -> torch.nn.Modu
     if video_wrapper is None:
         video_wrapper = build_video_wrapper(config)
 
-    # Compute action/joint normalization stats from dataset
+    # Get action/joint normalization stats from dataset's stats.json if available
+    # Falls back to computing from samples if stats.json not found
     action_mean_std = None
     joint_mean_std = None
     if dataset is not None:
-        if _is_main_process():
-            print("Computing action/joint normalization stats from dataset...")
-        action_mean_std, joint_mean_std = compute_normalizer_stats(dataset, num_samples=5000)
-        if _is_main_process():
-            real_a = action_mean_std[0][action_mean_std[1] < 0.999].numel()
-            print(f"  action_mean_std: shape={action_mean_std.shape}, "
-                  f"real dims mean range=[{action_mean_std[0,:real_a].min():.4f}, {action_mean_std[0,:real_a].max():.4f}], "
-                  f"std range=[{action_mean_std[1,:real_a].min():.4f}, {action_mean_std[1,:real_a].max():.4f}]")
+        stats = getattr(dataset, '_stats', None) or getattr(dataset, 'stats', {})
+        use_precomputed = False
+        dim_action = config.get("dim_action", 32)
+        dim_state = config.get("dim_joint_state", 64)
+
+        if stats:
+            # Try to build normalizer stats from dataset's stats.json
+            # LeRobot stats format: {"action": {"mean": [...], "std": [...]}, "observation.state": {...}}
+            try:
+                action_stats = stats.get("action", {})
+                state_stats = stats.get("observation.state", {})
+
+                if action_stats and state_stats:
+                    action_means = action_stats.get("mean", [])
+                    action_stds = action_stats.get("std", [])
+                    state_means = state_stats.get("mean", [])
+                    state_stds = state_stats.get("std", [])
+
+                    if action_means and state_means:
+                        # Pad to max dims
+                        action_mean = torch.zeros(dim_action)
+                        action_std = torch.ones(dim_action)
+                        action_mean[:len(action_means)] = torch.tensor(action_means, dtype=torch.float32)
+                        action_std[:len(action_stds)] = torch.tensor(action_stds, dtype=torch.float32).clamp(min=1e-6)
+
+                        state_mean = torch.zeros(dim_state)
+                        state_std = torch.ones(dim_state)
+                        state_mean[:len(state_means)] = torch.tensor(state_means, dtype=torch.float32)
+                        state_std[:len(state_stds)] = torch.tensor(state_stds, dtype=torch.float32).clamp(min=1e-6)
+
+                        action_mean_std = torch.stack([action_mean, action_std])
+                        joint_mean_std = torch.stack([state_mean, state_std])
+                        use_precomputed = True
+
+                        if _is_main_process():
+                            real_a = len(action_means)
+                            real_s = len(state_means)
+                            print(f"Using precomputed stats from dataset's stats.json")
+                            print(f"  action: {real_a} dims, state: {real_s} dims")
+                            print(f"  action_mean_std: mean=[{action_mean_std[0,:real_a].min():.4f}, {action_mean_std[0,:real_a].max():.4f}], "
+                                  f"std=[{action_mean_std[1,:real_a].min():.4f}, {action_mean_std[1,:real_a].max():.4f}]")
+            except (KeyError, TypeError) as e:
+                if _is_main_process():
+                    print(f"Could not use precomputed stats: {e}")
+
+        if not use_precomputed:
+            if _is_main_process():
+                print("Computing action/joint normalization stats from dataset samples...")
+            action_mean_std, joint_mean_std = compute_normalizer_stats(dataset, num_samples=5000)
+            if _is_main_process():
+                real_a = action_mean_std[0][action_mean_std[1] < 0.999].numel()
+                print(f"  action_mean_std: shape={action_mean_std.shape}, "
+                      f"real dims mean range=[{action_mean_std[0,:real_a].min():.4f}, {action_mean_std[0,:real_a].max():.4f}], "
+                      f"std range=[{action_mean_std[1,:real_a].min():.4f}, {action_mean_std[1,:real_a].max():.4f}]")
 
     # Build MimicVideo model
     model = MimicVideo(
@@ -102,6 +149,7 @@ def build_model(config: dict, dataset=None, video_wrapper=None) -> torch.nn.Modu
         heads=config.get("heads", 8),
         num_video_viewpoints=config.get("num_video_viewpoints", 2),
         model_output_clean=config.get("model_output_clean", False),
+        inject_language_tokens=config.get("inject_language_tokens", False),
         action_mean_std=action_mean_std,
         joint_mean_std=joint_mean_std,
     )
@@ -182,6 +230,10 @@ def main():
     parser.add_argument("--report_to", type=str, default=None, help="Reporting: wandb, tensorboard, none")
     parser.add_argument("--save_steps", type=int, default=None)
     parser.add_argument("--logging_steps", type=int, default=None)
+    parser.add_argument("--inject_language_tokens", action="store_true", default=None,
+                        help="Inject T5 language tokens into action head cross-attention")
+    parser.add_argument("--num_future_frames", type=int, default=None,
+                        help="Number of future video frames for Algorithm 2 (clean past, noised future)")
     args = parser.parse_args()
 
     # Build config
@@ -200,16 +252,27 @@ def main():
     # 1. Create dataset
     if is_main:
         print("Loading dataset...")
-    dataset = LeRobotLiberoDataset(
-        dataset_path=dataset_path,
+
+    # Import data config for future_frames support
+    from mimic_video.data.data_config import LiberoDataConfig
+
+    data_config = LiberoDataConfig(
         num_frames=config.get("num_frames", 1),
         video_resolution=config.get("video_resolution", 224),
+        num_future_frames=config.get("num_future_frames", 0),
+    )
+
+    dataset = LeRobotLiberoDataset(
+        dataset_path=dataset_path,
+        data_config=data_config,
         max_state_dim=config.get("dim_joint_state", 64),
         max_action_dim=config.get("dim_action", 32),
         training=True,
     )
     if is_main:
         print(f"Dataset loaded: {len(dataset)} steps")
+        if config.get("num_future_frames", 0) > 0:
+            print(f"  Using Algorithm 2 with {config.get('num_future_frames')} future frames")
 
     # 2. Build model
     # For multi-GPU: rank 0 builds video wrapper first (triggers HF Hub downloads),

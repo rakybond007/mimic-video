@@ -24,6 +24,7 @@ data_config: "libero"
 video_resolution: 224
 action_horizon: 16
 num_frames: 1                      # number of video frames (observation_indices length)
+num_future_frames: 1               # number of future video frames for training (paper Algorithm 2: clean past + noisy future)
 
 # ---- Training (HuggingFace TrainingArguments) ----
 output_dir: "./checkpoints/libero"
@@ -46,6 +47,7 @@ seed: 42
 
 # ---- Backbone ----
 freeze_video_backbone: true           # freeze Cosmos backbone, train only MimicVideo head (73M params)
+inject_language_tokens: false         # inject T5 language tokens into action head cross-attention (~2.1M params)
 
 # ---- LoRA (0 = disabled) ----
 lora_rank: 0
