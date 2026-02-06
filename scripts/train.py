@@ -293,12 +293,12 @@ def main():
     resume_checkpoint = config.get("resume_from_checkpoint", None)
 
     if no_resume:
-        # Explicitly disabled
+        # Explicitly disabled via --no_resume flag
         resume_checkpoint = None
         if is_main:
             print("Auto-resume disabled (--no_resume), starting fresh training")
-    elif resume_checkpoint == "auto" or resume_checkpoint is None:
-        # Auto-detect latest checkpoint
+    elif resume_checkpoint in (None, False, "auto", "true", True):
+        # Auto-detect latest checkpoint (None/False/auto/True all trigger auto-detection)
         latest_ckpt = find_latest_checkpoint(config.get("output_dir", "./checkpoints"))
         if latest_ckpt:
             if is_main:
@@ -306,7 +306,9 @@ def main():
             resume_checkpoint = latest_ckpt
         else:
             resume_checkpoint = None
-    # else: use the provided checkpoint path as-is
+            if is_main:
+                print("No existing checkpoint found, starting fresh training")
+    # else: use the provided checkpoint path string as-is
 
     runner = TrainRunner(
         model=model,
