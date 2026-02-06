@@ -198,7 +198,14 @@ class CosmosPredictWrapper(Module):
 
     @property
     def device(self):
-        return next(self.parameters()).device
+        # Try parameters first, then buffers, then default to cuda
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            try:
+                return next(self.buffers()).device
+            except StopIteration:
+                return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def _init_pretrained(self, model_name: str):
         from diffusers import CosmosVideoToWorldPipeline
@@ -530,6 +537,9 @@ class Cosmos2PredictWrapper(CosmosPredictWrapper):
         self._cached_text_states = encoder_states.detach()
 
         past_latents = self.vae.encode(videos).latent_dist.sample()
+
+        # Match encoder_states dtype to model (T5 outputs float32, but model may use bfloat16)
+        encoder_states = encoder_states.to(past_latents.dtype)
 
         # Algorithm 2: past clean (τ=0), future noised (τ=timestep)
         if exists(future_videos):

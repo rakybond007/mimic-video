@@ -234,6 +234,8 @@ def main():
                         help="Inject T5 language tokens into action head cross-attention")
     parser.add_argument("--num_future_frames", type=int, default=None,
                         help="Number of future video frames for Algorithm 2 (clean past, noised future)")
+    parser.add_argument("--future_frame_start", type=int, default=None,
+                        help="Starting index for future frames (default: 1, e.g., use 16 for distant future)")
     args = parser.parse_args()
 
     # Build config
@@ -260,6 +262,7 @@ def main():
         num_frames=config.get("num_frames", 1),
         video_resolution=config.get("video_resolution", 224),
         num_future_frames=config.get("num_future_frames", 0),
+        future_frame_start=config.get("future_frame_start", 1),
     )
 
     dataset = LeRobotLiberoDataset(
@@ -271,8 +274,13 @@ def main():
     )
     if is_main:
         print(f"Dataset loaded: {len(dataset)} steps")
+        print(f"  observation_indices (past frames): {data_config.observation_indices}")
+        print(f"  future_video_indices: {data_config.future_video_indices}")
+        print(f"  action_indices: {data_config.action_indices}")
         if config.get("num_future_frames", 0) > 0:
-            print(f"  Using Algorithm 2 with {config.get('num_future_frames')} future frames")
+            future_start = config.get("future_frame_start", 1)
+            future_end = future_start + config.get("num_future_frames") - 1
+            print(f"  Using Algorithm 2 with future frames at indices [{future_start}, {future_end}]")
 
     # 2. Build model
     # For multi-GPU: rank 0 builds video wrapper first (triggers HF Hub downloads),

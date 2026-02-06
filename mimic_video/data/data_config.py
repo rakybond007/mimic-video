@@ -84,13 +84,23 @@ class BaseDataConfig(ABC):
 class LiberoDataConfig(BaseDataConfig):
     """LIBERO dataset configuration."""
 
-    def __init__(self, num_frames: int = 1, video_resolution: int = 224, num_future_frames: int = 0):
+    def __init__(
+        self,
+        num_frames: int = 1,
+        video_resolution: int = 224,
+        num_future_frames: int = 0,
+        future_frame_start: int = 1,
+    ):
         # Set observation_indices based on num_frames (past frames)
         observation_indices = list(range(-num_frames + 1, 1))  # e.g. [0] for 1, [-1, 0] for 2
 
         # Set future_video_indices if num_future_frames > 0
         # Algorithm 2: future frames are at positive indices relative to current step
-        future_video_indices = list(range(1, num_future_frames + 1)) if num_future_frames > 0 else []
+        # future_frame_start allows specifying which timestep to start from (e.g., 16 for distant future)
+        if num_future_frames > 0:
+            future_video_indices = list(range(future_frame_start, future_frame_start + num_future_frames))
+        else:
+            future_video_indices = []
 
         super().__init__(
             video_keys=["video.front_view", "video.left_wrist_view"],

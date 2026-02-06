@@ -77,11 +77,15 @@ class BaseLeRobotDataset(Dataset):
         self.transforms = data_config.transform(training=training)
 
         # Parse delta indices per key
+        # Note: video and future_video share the same video_keys, so we need to use
+        # different key prefixes to avoid overwriting
         self._delta_indices: dict[str, np.ndarray] = {}
         self._modality_keys: dict[str, list[str]] = defaultdict(list)
         for modality, config in self.modality_configs.items():
             for key in config.modality_keys:
-                self._delta_indices[key] = np.array(config.delta_indices)
+                # Use "future_{key}" for future_video to avoid overwriting video keys
+                storage_key = f"future_{key}" if modality == "future_video" else key
+                self._delta_indices[storage_key] = np.array(config.delta_indices)
                 self._modality_keys[modality].append(key)
 
         # Load dataset metadata
@@ -212,7 +216,9 @@ class BaseLeRobotDataset(Dataset):
 
         for modality, keys in self._modality_keys.items():
             for key in keys:
-                delta_indices = self._delta_indices[key]
+                # Use "future_{key}" for future_video delta_indices lookup
+                storage_key = f"future_{key}" if modality == "future_video" else key
+                delta_indices = self._delta_indices[storage_key]
                 step_indices = base_step + delta_indices
 
                 if modality == "video":
