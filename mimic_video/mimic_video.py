@@ -315,9 +315,13 @@ class MimicVideo(Module):
         num_video_viewpoints = 1,
         video_time_denoise_mu = 0.,
         video_time_denoise_sigma = 1.,
+        inject_language_tokens = False,
         eps = 1e-5
     ):
         super().__init__()
+
+        # Language token injection
+        self.inject_language_tokens = inject_language_tokens
 
         self.depth = depth
 
@@ -350,6 +354,15 @@ class MimicVideo(Module):
         self.dim_video_hidden = dim_video_hidden
 
         self.view_emb = nn.Parameter(torch.randn(num_video_viewpoints, dim_video_hidden) * 1e-2) if num_video_viewpoints > 1 else None
+
+        # Language projection (for inject_language_tokens)
+        self.language_proj = None
+        if inject_language_tokens and exists(video_predict_wrapper):
+            text_dim = getattr(video_predict_wrapper, 'text_dim', 1024)
+            self.language_proj = nn.Sequential(
+                LinearNoBias(text_dim, dim_video_hidden),
+                nn.RMSNorm(dim_video_hidden),
+            )
 
         self.joint_normalizer = None
 
@@ -559,7 +572,8 @@ class MimicVideo(Module):
         task_ids = None,                # (b)
         advantage_ids = None,           # (b)
         dropout_advantage_ids = False,
-        video = None,                   # (b t c h w)
+        video = None,                   # (b v t c h w) or (b t c h w) - past video frames
+        future_video = None,            # (b v t c h w) or (b t c h w) - future video frames for Algorithm 2
         video_hiddens = None,           # (b nv dv) - they use layer 19 of cosmos predict, at first denoising step. that's all
         context_mask = None,
         time = None,                    # () | (b) | (b n)
@@ -594,6 +608,10 @@ class MimicVideo(Module):
 
             video = rearrange(video, 'b v ... -> (b v) ...')
 
+            # Also rearrange future_video if provided
+            if exists(future_video) and future_video.ndim == 6:
+                future_video = rearrange(future_video, 'b v ... -> (b v) ...')
+
             if exists(prompts):
                 if isinstance(prompts, str):
                     prompts = [prompts] * (batch * num_views)
@@ -615,6 +633,9 @@ class MimicVideo(Module):
             if time_video_denoise.shape[0] != batch:
                 time_video_denoise = repeat(time_video_denoise, '1 -> b', b = batch)
 
+        # Language tokens for injection (extracted after video forward)
+        lang_tokens = None
+
         if not exists(cache):
             # handle maybe extraction of video hiddens
             # only if cache is not given
@@ -625,18 +646,34 @@ class MimicVideo(Module):
                 assert exists(self.video_predict_wrapper), f'`video_predict_wrapper` must be passed in if raw video is passed into MimicVideo'
 
                 video_forward_wrap = eval_no_grad if no_grad_video_model_forward else identity
-        
+
                 video_timestep = time_video_denoise
                 if has_multi_view:
                     video_timestep = repeat(time_video_denoise, 'b -> (b v)', v = num_views)
 
-                video_hiddens = video_forward_wrap(self.video_predict_wrapper)(
-                    video,
+                # Pass future_videos for Algorithm 2 if provided and wrapper supports it
+                wrapper_kwargs = dict(
                     prompts = prompts,
                     prompt_token_ids = prompt_token_ids,
                     timestep = video_timestep,
                     predict_num_future_latents = predict_num_future_latents
                 )
+
+                # Check if wrapper supports future_videos (Cosmos2PredictWrapper)
+                if exists(future_video) and hasattr(self.video_predict_wrapper, '_cached_text_states'):
+                    wrapper_kwargs['future_videos'] = future_video
+
+                video_hiddens = video_forward_wrap(self.video_predict_wrapper)(video, **wrapper_kwargs)
+
+                # Extract language tokens if inject_language_tokens is enabled
+                if self.inject_language_tokens and exists(self.language_proj):
+                    text_states = getattr(self.video_predict_wrapper, '_cached_text_states', None)
+                    if exists(text_states):
+                        text_states = text_states.to(self.device).float()
+                        # Deduplicate per-view repeats for multi-view
+                        if has_multi_view:
+                            text_states = text_states[::num_views]
+                        lang_tokens = self.language_proj(text_states)
 
                 video_hiddens = tree_map_tensor(lambda t: t.to(self.device).float(), video_hiddens) # maybe bfloat to float32
 
@@ -810,11 +847,19 @@ class MimicVideo(Module):
             tokens, gate = cross_attn_norm(tokens, time_cond)
 
             layer_video_hidden = None
+            layer_context_mask = context_mask
 
             if exists(video_hiddens):
                 layer_video_hidden = video_hiddens[layer_video_hidden_index]
 
-            cross_attn_out, video_kv = cross_attn(tokens, context = layer_video_hidden, context_mask = context_mask, kv = cached_video_kv, return_kv = True)
+            # Inject language tokens into cross-attention context
+            if exists(lang_tokens) and exists(layer_video_hidden) and not exists(cached_video_kv):
+                layer_video_hidden = cat([layer_video_hidden, lang_tokens], dim=1)
+                if exists(layer_context_mask):
+                    lang_mask = torch.ones(batch, lang_tokens.shape[1], device=layer_context_mask.device, dtype=layer_context_mask.dtype)
+                    layer_context_mask = cat([layer_context_mask, lang_mask], dim=1)
+
+            cross_attn_out, video_kv = cross_attn(tokens, context = layer_video_hidden, context_mask = layer_context_mask, kv = cached_video_kv, return_kv = True)
 
             tokens = add_residual(cross_attn_out * gate)
 

@@ -269,6 +269,9 @@ class MimicVideoPolicy:
                 state_dict["joint_normalizer.std"],
             ])
 
+        # Auto-detect language injection from checkpoint weights
+        inject_language_tokens = any(k.startswith("language_proj.") for k in state_dict)
+
         # Build model (architecture must match training)
         video_wrapper = _build_video_wrapper(ckpt_path)
         model = MimicVideo(
@@ -279,6 +282,7 @@ class MimicVideoPolicy:
             dim_joint_state=config["dim_joint_state"],
             num_video_viewpoints=2,
             model_output_clean=False,
+            inject_language_tokens=inject_language_tokens,
             action_mean_std=action_mean_std,
             joint_mean_std=joint_mean_std,
         )
