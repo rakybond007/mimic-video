@@ -42,7 +42,7 @@ class TrainRunner:
         model: torch.nn.Module,
         training_args: TrainingArguments,
         train_dataset,
-        resume_from_checkpoint: bool = False,
+        resume_from_checkpoint: bool | str | None = None,
         freeze_video_backbone: bool = True,
     ):
         self.training_args = training_args

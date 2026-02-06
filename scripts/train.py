@@ -152,6 +152,28 @@ def build_training_args(config: dict) -> TrainingArguments:
     )
 
 
+def find_latest_checkpoint(output_dir: str) -> str | None:
+    """Find the latest checkpoint in output_dir for auto-resume."""
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return None
+
+    # Find all checkpoint-* directories
+    checkpoints = list(output_path.glob("checkpoint-*"))
+    if not checkpoints:
+        return None
+
+    # Sort by step number and return the latest
+    def get_step(ckpt_path):
+        try:
+            return int(ckpt_path.name.split("-")[1])
+        except (IndexError, ValueError):
+            return 0
+
+    latest = max(checkpoints, key=get_step)
+    return str(latest)
+
+
 def main():
     # ---- Distributed setup ----
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -172,7 +194,10 @@ def main():
     parser.add_argument("--per_device_train_batch_size", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
     parser.add_argument("--lora_rank", type=int, default=None)
-    parser.add_argument("--resume_from_checkpoint", action="store_true", default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Resume from checkpoint path, or 'auto' to auto-detect latest")
+    parser.add_argument("--no_resume", action="store_true",
+                        help="Disable auto-resume even if checkpoints exist (start fresh)")
     parser.add_argument("--num_frames", type=int, default=None)
     parser.add_argument("--video_resolution", type=int, default=None)
     parser.add_argument("--freeze_video_backbone", action="store_true", default=None,
@@ -262,11 +287,32 @@ def main():
 
     # 5. Create runner and train
     freeze_backbone = config.get("freeze_video_backbone", True)
+
+    # Auto-resume: check for existing checkpoints in output_dir
+    no_resume = config.get("no_resume", False)
+    resume_checkpoint = config.get("resume_from_checkpoint", None)
+
+    if no_resume:
+        # Explicitly disabled
+        resume_checkpoint = None
+        if is_main:
+            print("Auto-resume disabled (--no_resume), starting fresh training")
+    elif resume_checkpoint == "auto" or resume_checkpoint is None:
+        # Auto-detect latest checkpoint
+        latest_ckpt = find_latest_checkpoint(config.get("output_dir", "./checkpoints"))
+        if latest_ckpt:
+            if is_main:
+                print(f"Found existing checkpoint, resuming from: {latest_ckpt}")
+            resume_checkpoint = latest_ckpt
+        else:
+            resume_checkpoint = None
+    # else: use the provided checkpoint path as-is
+
     runner = TrainRunner(
         model=model,
         training_args=training_args,
         train_dataset=dataset,
-        resume_from_checkpoint=config.get("resume_from_checkpoint", False),
+        resume_from_checkpoint=resume_checkpoint,
         freeze_video_backbone=freeze_backbone,
     )
     runner.train()
