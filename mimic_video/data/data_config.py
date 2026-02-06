@@ -146,19 +146,11 @@ class LiberoDataConfig(BaseDataConfig):
                     hue=0.08,
                 )
             )
-        transforms.append(
-            StateActionNormalize(
-                apply_to=self.state_keys + self.action_keys,
-                normalization_modes={
-                    "state.eef_pos_absolute": "min_max",
-                    "state.eef_rot_absolute": "min_max",
-                    "state.gripper_close": "min_max",
-                    "action.eef_pos_delta": "min_max",
-                    "action.eef_rot_delta": "min_max",
-                    "action.gripper_close": "min_max",
-                },
-            )
-        )
+        # Note: State/action normalization is handled by MimicVideo's internal
+        # Normalizer (mean/std from stats.json). Do NOT apply StateActionNormalize
+        # here, as it would create a mismatch between training and inference:
+        # - Training: StateActionNormalize + Model.Normalizer (double normalization)
+        # - Inference: Model.Normalizer only (policy provides raw values)
         return Compose(transforms)
 
 
