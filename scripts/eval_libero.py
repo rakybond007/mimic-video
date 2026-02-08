@@ -60,6 +60,18 @@ def main():
     parser.add_argument("--num_trials_per_task", type=int, default=50)
     parser.add_argument("--num_steps_wait", type=int, default=10)
     parser.add_argument("--denoising_steps", type=int, default=16)
+    parser.add_argument(
+        "--num_frames",
+        type=int,
+        default=8,
+        help="Number of past frames for temporal context (should match training)",
+    )
+    parser.add_argument(
+        "--replan_step",
+        type=int,
+        default=1,
+        help="Execute this many actions before replanning (default: 1 = replan every step)",
+    )
     parser.add_argument("--headless", action="store_true", default=False)
     parser.add_argument("--no_save_videos", action="store_true", default=False)
     parser.add_argument("--log_dir", type=str, default="/tmp/logs")
@@ -98,10 +110,13 @@ def main():
         "task_suite_name": args.task_suite_name,
         "num_trials_per_task": args.num_trials_per_task,
         "num_steps_wait": args.num_steps_wait,
+        "num_frames": args.num_frames,
+        "replan_step": args.replan_step,
         "headless": args.headless,
         "save_videos": not args.no_save_videos,
         "log_dir": args.log_dir,
     }
+    print(f"Evaluation config: num_frames={args.num_frames}, replan_step={args.replan_step}")
 
     # Run evaluation
     results = eval_libero(policy, cfg)
