@@ -97,6 +97,11 @@ def main():
         "--checkpoint_path", type=str, required=True,
         help="Path to model checkpoint directory",
     )
+    parser.add_argument(
+        "--stats_path", type=str,
+        default="/sjw_alinlab2/home/myungkyu/workspace/AlinVLA/.cache/huggingface/lerobot/kimtaey/libero_gr00t_delta",
+        help="Path to dataset with stats.json for normalization",
+    )
     parser.add_argument("--port", type=int, default=5555, help="HTTP server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind host")
     parser.add_argument("--device", type=str, default="cuda", help="Device for inference")
@@ -107,9 +112,11 @@ def main():
     from mimic_video.policy import MimicVideoPolicy
 
     print(f"Loading policy from {args.checkpoint_path}...")
+    print(f"Using stats from {args.stats_path}")
     t0 = time.time()
     policy = MimicVideoPolicy.from_checkpoint(
         args.checkpoint_path,
+        stats_path=args.stats_path,
         device=args.device,
         denoising_steps=args.denoising_steps,
     )
